@@ -1,60 +1,46 @@
 #pragma once
-#pragma comment(lib, "Ws2_32.lib")
-#include <WinSock2.h>
-#include <iostream>
-#define PORT 9009
-class Inline_IPv4_Broadcast_UDP
-{
+#include "../discovery.hpp"
+
+#include <algorithm>
+
+class Inline_IPv4_Broadcast_UDP {
 public:
-	Inline_IPv4_Broadcast_UDP() {
-		m_error = WSAStartup(MAKEWORD(2, 2), &m_wsa);
-		if (m_error != 0) {
-			std::cout << "WSAStartup failed with ErrorCode:" << m_error << "\n";
-		}
+    explicit Inline_IPv4_Broadcast_UDP(std::uint16_t port = 9009, DWORD timeout_ms = 5000,
+                                       const std::string& destination = "255.255.255.255",
+                                       const std::string& bind_address = "0.0.0.0")
+        : destination_(discovery::address(destination, port)), timeout_ms_(timeout_ms) {
+        if (port == 0 || timeout_ms == 0) {
+            throw std::invalid_argument("Destination port and timeout must be positive.");
+        }
+        const BOOL enabled = TRUE;
+        if (setsockopt(socket_.get(), SOL_SOCKET, SO_BROADCAST,
+                       reinterpret_cast<const char*>(&enabled), sizeof(enabled)) == SOCKET_ERROR) {
+            throw discovery::socket_error("setsockopt(SO_BROADCAST)");
+        }
+        socket_.bind_to(bind_address, 0);
+    }
 
-		m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    discovery::Peer Broadcast() {
+        const auto deadline = discovery::deadline_after(timeout_ms_);
+        while (discovery::Clock::now() < deadline) {
+            discovery::send_token(socket_.get(), destination_);
+            const auto retry_at = std::min(deadline, discovery::Clock::now() +
+                                                     std::chrono::milliseconds(500));
+            while (discovery::wait_readable(socket_.get(), retry_at)) {
+                sockaddr_in peer{};
+                if (discovery::receive_token(socket_.get(), peer) &&
+                    peer.sin_port == destination_.sin_port &&
+                    (destination_.sin_addr.s_addr == INADDR_BROADCAST ||
+                     destination_.sin_addr.s_addr == peer.sin_addr.s_addr)) {
+                    return discovery::describe(peer);
+                }
+            }
+        }
+        throw std::runtime_error("Server discovery timed out.");
+    }
 
-		if (setsockopt(m_socket, SOL_SOCKET, SO_BROADCAST, (const char*) & m_broadcast, sizeof(m_broadcast)) < 0) {
-			std::cout << "Error setting Broadcast option\n";
-			closesocket(m_socket);
-		}
-
-		m_send_addr.sin_family = AF_INET;
-		m_send_addr.sin_port = htons(PORT);
-		m_send_addr.sin_addr.s_addr = INADDR_BROADCAST;
-
-		m_error = ioctlsocket(m_socket, FIONBIO, &iMode);
-		if (m_error != NO_ERROR)
-			printf("ioctlsocket failed with error: %ld\n", m_error);
-	};
-
-	~Inline_IPv4_Broadcast_UDP() {
-		closesocket(m_socket);
-		WSACleanup();
-	};
-
-	void Broadcast() {
-		while (m_buffer_recv!= m_buffer_send)
-		{
-			if (sendto(m_socket, (char*)&m_buffer_send, sizeof(m_buffer_send), 0, (sockaddr*)&m_send_addr, sizeof(struct sockaddr_in)) < 0) {
-				std::cout << "Error in Sending." << WSAGetLastError();
-				closesocket(m_socket);
-			}
-			recvfrom(m_socket, (char*)&m_buffer_recv, 50, 0, (sockaddr*)&m_recv_addr, &m_addr_size);
-		}
-		std::cout << "Received Message is : " << m_buffer_recv;
-	};
 private:
-	WSADATA m_wsa;
-	SOCKET m_socket;
-	u_long iMode = 1;
-	int m_error = 0;
-
-	struct sockaddr_in m_send_addr;
-	struct sockaddr_in m_recv_addr;
-	int m_addr_size = sizeof(struct sockaddr_in);
-	
-	char m_broadcast = '1';
-	int m_buffer_recv = 0;
-	int m_buffer_send = 0xB00B5;
+    discovery::Socket socket_;
+    sockaddr_in destination_{};
+    DWORD timeout_ms_;
 };
